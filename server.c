@@ -115,7 +115,8 @@ int main() {
         exit(EXIT_FAILURE);
     }
 
-    log_message("Server started.");
+    // 콘솔 출력
+    printf("Server started.\n");
 
     // 소켓 생성
     server_socket = socket(AF_INET, SOCK_STREAM, 0);
@@ -150,7 +151,8 @@ int main() {
         exit(EXIT_FAILURE);
     }
 
-    log_message("Server is running. Waiting for connections...");
+    // 콘솔 출력
+    printf("Server is running. Waiting for connections on port %d...\n", PORT);
 
     // 성능 로깅 스레드 생성
     pthread_t logger_thread;
