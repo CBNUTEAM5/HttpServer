@@ -51,6 +51,20 @@ int main() {
 
     printf("Client connected.\n");
 
+    // HTTP 응답 전송
+    const char *response =
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Type: text/plain\r\n"
+        "Content-Length: 13\r\n"
+        "\r\n"
+        "Hello, World!";
+    ssize_t bytes_written = write(client_socket, response, strlen(response));
+    if (bytes_written < 0) {
+        perror("Write failed");
+    } else {
+        printf("HTTP response sent to client.\n");
+    }
+
     close(client_socket);
     close(server_socket);
 
