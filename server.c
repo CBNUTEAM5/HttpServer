@@ -3,25 +3,21 @@
 #include <string.h>
 #include <unistd.h>
 #include <arpa/inet.h>
-#include <pthread.h>
-#include <time.h>
+#include <fcntl.h>
+#include <sys/epoll.h>
 #include <sys/stat.h>
+#include <time.h>
+#include <pthread.h>
 
 #define PORT 8080
 #define BUFFER_SIZE 1024
 #define THREAD_POOL_SIZE 4
-#define QUEUE_SIZE 10
 #define ROOT_DIR "./www" // 정적 파일 루트 디렉토리
+#define MAX_EVENTS 10
 
 typedef struct {
     int client_socket;
 } Task;
-
-Task task_queue[QUEUE_SIZE];
-int queue_front = 0, queue_rear = 0, queue_count = 0;
-pthread_mutex_t queue_mutex = PTHREAD_MUTEX_INITIALIZER;
-pthread_cond_t queue_not_empty = PTHREAD_COND_INITIALIZER;
-pthread_cond_t queue_not_full = PTHREAD_COND_INITIALIZER;
 
 FILE *log_file;
 pthread_mutex_t log_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -41,33 +37,6 @@ void log_message(const char *message) {
             t->tm_hour, t->tm_min, t->tm_sec, message);
     fflush(log_file);
     pthread_mutex_unlock(&log_mutex);
-}
-
-// 작업 큐에 태스크 추가
-void enqueue_task(Task task) {
-    pthread_mutex_lock(&queue_mutex);
-    while (queue_count == QUEUE_SIZE) {
-        pthread_cond_wait(&queue_not_full, &queue_mutex);
-    }
-    task_queue[queue_rear] = task;
-    queue_rear = (queue_rear + 1) % QUEUE_SIZE;
-    queue_count++;
-    pthread_cond_signal(&queue_not_empty);
-    pthread_mutex_unlock(&queue_mutex);
-}
-
-// 작업 큐에서 태스크 제거
-Task dequeue_task() {
-    pthread_mutex_lock(&queue_mutex);
-    while (queue_count == 0) {
-        pthread_cond_wait(&queue_not_empty, &queue_mutex);
-    }
-    Task task = task_queue[queue_front];
-    queue_front = (queue_front + 1) % QUEUE_SIZE;
-    queue_count--;
-    pthread_cond_signal(&queue_not_full);
-    pthread_mutex_unlock(&queue_mutex);
-    return task;
 }
 
 // 요청에서 파일 이름 추출
@@ -147,15 +116,6 @@ void handle_client(int client_socket) {
     pthread_mutex_unlock(&stats_mutex);
 }
 
-// 스레드 풀에서 작업 처리
-void *worker_thread(void *arg) {
-    while (1) {
-        Task task = dequeue_task();
-        handle_client(task.client_socket);
-    }
-    return NULL;
-}
-
 int main() {
     mkdir(ROOT_DIR, 0755); // www 디렉토리 생성
     int server_socket;
@@ -200,21 +160,56 @@ int main() {
 
     printf("Server is running. Waiting for connections on port %d...\n", PORT);
 
-    pthread_t thread_pool[THREAD_POOL_SIZE];
-    for (int i = 0; i < THREAD_POOL_SIZE; i++) {
-        pthread_create(&thread_pool[i], NULL, worker_thread, NULL);
+    // epoll 준비
+    int epoll_fd = epoll_create1(0);
+    if (epoll_fd == -1) {
+        perror("Epoll creation failed");
+        close(server_socket);
+        fclose(log_file);
+        exit(EXIT_FAILURE);
+    }
+
+    struct epoll_event ev, events[MAX_EVENTS];
+    ev.events = EPOLLIN;
+    ev.data.fd = server_socket;
+    if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, server_socket, &ev) == -1) {
+        perror("Epoll_ctl failed");
+        close(server_socket);
+        fclose(log_file);
+        exit(EXIT_FAILURE);
     }
 
     while (1) {
-        int client_socket = accept(server_socket, (struct sockaddr *)&client_addr, &client_addr_len);
-        if (client_socket == -1) {
-            perror("Accept failed");
-            log_message("Error: Failed to accept client connection.");
-            continue;
+        int nfds = epoll_wait(epoll_fd, events, MAX_EVENTS, -1);
+        if (nfds == -1) {
+            perror("Epoll wait error");
+            break;
         }
-        Task task;
-        task.client_socket = client_socket;
-        enqueue_task(task);
+
+        for (int i = 0; i < nfds; i++) {
+            if (events[i].data.fd == server_socket) {
+                // 새로운 클라이언트 연결 수락
+                int client_socket = accept(server_socket, (struct sockaddr *)&client_addr, &client_addr_len);
+                if (client_socket == -1) {
+                    perror("Accept failed");
+                    continue;
+                }
+
+                // 클라이언트 소켓을 epoll에 등록
+                ev.events = EPOLLIN | EPOLLET; // 에지 트리거 모드
+                ev.data.fd = client_socket;
+                if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, client_socket, &ev) == -1) {
+                    perror("Epoll_ctl failed");
+                    close(client_socket);
+                    continue;
+                }
+            } else {
+                // 클라이언트 요청 처리
+                handle_client(events[i].data.fd);
+                epoll_ctl(epoll_fd, EPOLL_CTL_DEL, events[i].data.fd, NULL); // 요청 처리 후 클라이언트 소켓 삭제
+                close(events[i].data.fd);
+            }
+        }
     }
 
     close(server_socket);
